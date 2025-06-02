@@ -1,7 +1,0 @@
-docker run --rm -it \
-    --name मेरा-dhcp-server \
-    --network host \
-    --cap-add NET_ADMIN \
-    --cap-add NET_RAW \
-    -v ./dhcp_data_volume:/data \
-    dhcp-manager-app
