@@ -1,0 +1,12 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+dhcp_server_data.db 
+# dhcp_server_data.db.* # Se SQLite crea file di journaling
+build/
+dist/
+*.spec

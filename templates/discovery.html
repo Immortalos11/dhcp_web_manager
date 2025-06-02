@@ -1,0 +1,298 @@
+{% extends "base.html" %}
+{% block title %}Scoperta Rete Locale{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-7">
+        <h2>Scoperta Dispositivi sulla Rete Locale</h2>
+        <p>Questa utility tenta di trovare dispositivi attivi sulla rete specificata. La scansione può richiedere del tempo.</p>
+        <p class="text-warning"><i class="bi bi-exclamation-triangle-fill"></i> La scansione viene eseguita dalla macchina server. Assicurati che la sua interfaccia di rete sia sulla subnet corretta.</p>
+
+        <div class="row mb-3">
+            <div class="col-md-8 col-lg-7">
+                <label for="networkCidr" class="form-label fw-bold">Rete da Scansionare (es. 192.168.1.0/24):</label>
+                <input type="text" class="form-control" id="networkCidr" value="{{ default_subnet or '192.168.1.0/24' }}">
+            </div>
+            <div class="col-md-4 col-lg-5 align-self-end mt-2 mt-md-0">
+                <button id="startScanButton" class="btn btn-primary w-100"><i class="bi bi-search"></i> Avvia Scansione</button>
+                <button id="stopScanButton" class="btn btn-danger w-100" style="display: none;"><i class="bi bi-stop-circle"></i> Interrompi Scansione</button>
+            </div>
+        </div>
+
+        <div id="scanStatus" class="mb-3 alert" role="alert" style="display: none;">
+            </div>
+
+        <h4>Dispositivi Rilevati:</h4>
+        <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+            <table class="table table-striped table-hover table-sm">
+                <thead>
+                    <tr>
+                        <th>Indirizzo IP</th>
+                        <th>Indirizzo MAC</th>
+                        <th>Hostname</th>
+                        <th>Stato</th>
+                        <th>Azione</th>
+                    </tr>
+                </thead>
+                <tbody id="discovered-devices-table-body">
+                    <tr><td colspan="5" class="text-center">Nessuna scansione eseguita o nessun risultato.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div class="col-lg-5 mt-4 mt-lg-0">
+        <h2>Log Applicazione</h2>
+        <div class="card">
+            <div class="card-body">
+                <div id="discoveryLogBox" class="bg-dark text-white p-3 rounded" style="height: 550px; overflow-y: scroll;">
+                    Caricamento log...
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const networkCidrInput = document.getElementById('networkCidr');
+    const startScanButton = document.getElementById('startScanButton');
+    const stopScanButton = document.getElementById('stopScanButton');
+    const scanStatusDiv = document.getElementById('scanStatus');
+    const discoveredDevicesTableBody = document.getElementById('discovered-devices-table-body');
+    const discoveryLogBox = document.getElementById('discoveryLogBox');
+
+    let scanPollingInterval = null;
+    let logPollingInterval = null;
+
+    function updateScanUI(inProgress, networkCidrForScan, message = null, isError = false) {
+        if (inProgress) {
+            scanStatusDiv.innerHTML = `
+                <div class="d-flex align-items-center">
+                    <div class="spinner-border spinner-border-sm text-primary me-2" role="status"></div>
+                    <span>Scansione in corso per <strong>${networkCidrForScan || 'rete...'}</strong></span>
+                </div>`;
+            scanStatusDiv.className = 'mb-3 alert alert-info';
+            scanStatusDiv.style.display = 'block';
+            startScanButton.disabled = true;
+            startScanButton.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Scansione...';
+            stopScanButton.style.display = 'inline-block';
+            stopScanButton.disabled = false;
+            networkCidrInput.disabled = true;
+        } else {
+            scanStatusDiv.style.display = message ? 'block' : 'none';
+            if (message) {
+                scanStatusDiv.textContent = message;
+                if (isError) {
+                     scanStatusDiv.className = 'mb-3 alert alert-danger';
+                } else {
+                    scanStatusDiv.className = 'mb-3 alert alert-success';
+                }
+            } else {
+                 scanStatusDiv.style.display = 'none'; // Nascondi se non c'è messaggio
+            }
+
+            startScanButton.disabled = false;
+            startScanButton.innerHTML = '<i class="bi bi-search"></i> Avvia Scansione';
+            stopScanButton.style.display = 'none';
+            stopScanButton.disabled = true;
+            networkCidrInput.disabled = false;
+            if (scanPollingInterval) {
+                clearInterval(scanPollingInterval);
+                scanPollingInterval = null;
+            }
+        }
+    }
+
+    function populateScanResults(devices) {
+        discoveredDevicesTableBody.innerHTML = ''; 
+        if (devices && devices.length > 0 && (!devices[0].ip || devices[0].ip !== "Errore")) { 
+            let onlineCount = 0;
+            devices.forEach(device => {
+                const row = document.createElement('tr');
+                const macDisplay = device.mac_display || device.mac || 'N/A';
+                const hostnameDisplay = device.hostname || 'N/A';
+                let statusBadgeClass = 'bg-secondary';
+                if (device.status === 'Online') {
+                    statusBadgeClass = 'bg-success';
+                    onlineCount++;
+                } else if (device.status === 'Ping Timeout') {
+                    statusBadgeClass = 'bg-warning text-dark';
+                } else if (device.status === 'Errore Ping') {
+                    statusBadgeClass = 'bg-danger';
+                }
+
+                row.innerHTML = `
+                    <td>${device.ip}</td>
+                    <td>${macDisplay}</td>
+                    <td>${hostnameDisplay}</td>
+                    <td><span class="badge ${statusBadgeClass}">${device.status}</span></td>
+                    <td>
+                        ${ (device.mac && device.mac !== 'N/A' && device.mac !== 'N/A (Errore ARP)' && device.status === 'Online') ? 
+                          `<button class="btn btn-sm btn-outline-primary add-reservation-btn" data-mac="${device.mac}" data-ip="${device.ip}" title="Crea prenotazione statica per ${macDisplay} con IP ${device.ip}">+ Prenota</button>` : '' }
+                    </td>
+                `;
+                discoveredDevicesTableBody.appendChild(row);
+            });
+            if (onlineCount === 0 && devices.length > 0) { 
+                 discoveredDevicesTableBody.innerHTML = '<tr><td colspan="5" class="text-center">Nessun dispositivo ha risposto al ping. Controlla il range di rete e i firewall.</td></tr>';
+            }
+        } else if (devices && devices.length > 0 && devices[0].ip === "Errore") { 
+             discoveredDevicesTableBody.innerHTML = `<tr><td colspan="5" class="text-center text-danger">Errore durante la scansione: ${devices[0].mac || 'Dettagli non disponibili'}</td></tr>`;
+        }
+        else { 
+            discoveredDevicesTableBody.innerHTML = '<tr><td colspan="5" class="text-center">Nessun risultato dalla scansione precedente o nessun dispositivo trovato.</td></tr>';
+        }
+    }
+    
+    function fetchLastScanResults() {
+        fetch('/api/get_last_scan_results')
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    populateScanResults(data.devices);
+                    updateScanUI(false, null, data.devices && data.devices.length > 0 ? "Ultimi risultati della scansione visualizzati." : "Nessun risultato precedente trovato.");
+                } else {
+                    console.error("Errore API get_last_scan_results:", data.message);
+                    updateScanUI(false, null, "Errore nel caricare i risultati della scansione.", true);
+                    populateScanResults([]);
+                }
+            })
+            .catch(err => {
+                console.error("Errore fetch ultimi risultati scansione:", err);
+                updateScanUI(false, null, "Errore di rete nel caricare i risultati.", true);
+                populateScanResults([]);
+            });
+    }
+
+    function checkScanStatus() {
+        fetch('/api/scan_status')
+            .then(response => response.json())
+            .then(data => {
+                if (data.in_progress) {
+                    updateScanUI(true, data.network_cidr);
+                    if (!scanPollingInterval) { 
+                        scanPollingInterval = setInterval(checkScanStatus, 3000);
+                    }
+                } else { 
+                    updateScanUI(false, data.network_cidr, data.network_cidr ? `Scansione per ${data.network_cidr} completata o interrotta.` : "Pronto per una nuova scansione.");
+                    if (data.has_results) {
+                        fetchLastScanResults(); 
+                    } else {
+                        populateScanResults([]);
+                    }
+                }
+            })
+            .catch(err => {
+                console.error("Errore checkScanStatus:", err);
+                updateScanUI(false, null, "Errore nel recuperare lo stato della scansione.", true);
+            });
+    }
+
+    function updateDiscoveryLogs() {
+        if (!discoveryLogBox) return;
+        fetch('/api/logs')
+            .then(response => response.json())
+            .then(data => {
+                discoveryLogBox.innerHTML = '';
+                data.forEach(log => {
+                   const line = document.createElement('div');
+                   line.className = 'log-line';
+                   let color = 'white';
+                   if (log.level === 'WARNING') color = 'yellow';
+                   else if (log.level === 'ERROR' || log.level === 'CRITICAL') color = 'red';
+                   else if (log.level === 'INFO') color = '#88ddff';
+                   line.style.color = color;
+                   line.textContent = `${log.time} - ${log.level} - ${log.message}`;
+                   discoveryLogBox.appendChild(line);
+                });
+                discoveryLogBox.scrollTop = discoveryLogBox.scrollHeight;
+            })
+            .catch(err => console.error("Errore fetch logs per discovery:", err));
+    }
+
+    if (startScanButton) {
+        startScanButton.addEventListener('click', function() {
+            const networkToScan = networkCidrInput.value.trim();
+            if (!networkToScan) {
+                alert("Per favore, inserisci un range di rete da scansionare (es. 192.168.1.0/24).");
+                return;
+            }
+            updateScanUI(true, networkToScan); 
+            discoveredDevicesTableBody.innerHTML = '<tr><td colspan="5" class="text-center">Avvio scansione...</td></tr>';
+
+            fetch('/api/start_network_scan', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ network_cidr: networkToScan })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    if (!scanPollingInterval) { 
+                        scanPollingInterval = setInterval(checkScanStatus, 3000);
+                    }
+                } else {
+                    updateScanUI(false, networkToScan, data.message || "Errore avvio scansione.", true);
+                    populateScanResults([]);
+                }
+            })
+            .catch(err => {
+                updateScanUI(false, networkToScan, 'Errore di rete durante l\'avvio della scansione.', true);
+                console.error("Errore fetch start_network_scan:", err);
+            });
+        });
+    }
+
+    if (stopScanButton) {
+        stopScanButton.addEventListener('click', function() {
+            updateScanUI(true, networkCidrInput.value.trim(), "Interruzione scansione richiesta..."); // Aggiorna subito il messaggio
+            stopScanButton.disabled = true; 
+
+            fetch('/api/stop_network_scan', { method: 'POST' })
+            .then(response => response.json())
+            .then(data => {
+                console.log("Risposta stop_network_scan:", data.message);
+                // Non fare nulla qui, checkScanStatus gestirà l'aggiornamento finale della UI
+            })
+            .catch(err => {
+                console.error("Errore fetch stop_network_scan:", err);
+                updateScanUI(true, networkCidrInput.value.trim(), 'Errore invio richiesta interruzione.', true);
+                stopScanButton.disabled = false; // Riabilita se la richiesta API fallisce
+            });
+        });
+    }
+
+    if (discoveredDevicesTableBody) {
+        discoveredDevicesTableBody.addEventListener('click', function(event) {
+            const targetButton = event.target.closest('.add-reservation-btn');
+            if (targetButton) {
+                const mac = targetButton.dataset.mac;
+                const ip = targetButton.dataset.ip;
+                if (mac && ip) {
+                    // Il MAC qui arriva già normalizzato (senza due punti) da network_tools.py
+                    // Per il form, è meglio averlo con i due punti
+                    let formattedMacForForm = mac;
+                    if (mac.length === 12 && !mac.includes(':')) {
+                         formattedMacForForm = mac.match(/.{1,2}/g).join(':').toLowerCase();
+                    }
+                    window.location.href = `/reservations?mac=${encodeURIComponent(formattedMacForForm)}&ip=${encodeURIComponent(ip)}`;
+                }
+            }
+        });
+    }
+
+    checkScanStatus();
+    updateDiscoveryLogs();
+    if(!logPollingInterval) {
+        logPollingInterval = setInterval(updateDiscoveryLogs, 3000); // Aumentato intervallo log
+    }
+
+    window.addEventListener('beforeunload', () => {
+        if (scanPollingInterval) clearInterval(scanPollingInterval);
+        if (logPollingInterval) clearInterval(logPollingInterval);
+    });
+});
+</script>
+{% endblock %}

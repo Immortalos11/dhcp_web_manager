@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Prenotazioni Statiche{% endblock %}
+
+{% block content %}
+<h2>Gestione Prenotazioni Statiche</h2>
+<p class="text-warning"><i class="bi bi-exclamation-circle-fill"></i> Il server DHCP deve essere arrestato e riavviato (dalla tab "Controllo Server") affinché le modifiche alle prenotazioni diventino operative.</p>
+<div class="row">
+    <div class="col-md-5">
+        <h4>Aggiungi/Modifica Prenotazione</h4>
+        <form method="POST" action="{{ url_for('add_reservation_route') }}">
+             {{ form.csrf_token }}
+             <div class="mb-3">
+                <label for="{{ form.mac_address.id }}" class="form-label fw-bold">{{ form.mac_address.label.text }}</label>
+                {{ form.mac_address(class="form-control", placeholder="AA:BB:CC:00:11:22") }}
+             </div>
+             <div class="mb-3">
+                <label for="{{ form.ip_address.id }}" class="form-label fw-bold">{{ form.ip_address.label.text }}</label>
+                {{ form.ip_address(class="form-control", placeholder="192.168.1.X") }}
+             </div>
+            <button type="submit" class="btn btn-success"><i class="bi bi-plus-circle"></i> Aggiungi/Aggiorna</button>
+        </form>
+    </div>
+    <div class="col-md-7">
+        <h4>Prenotazioni Esistenti</h4>
+        <div class="table-responsive">
+             <table class="table table-striped table-hover table-sm">
+                <thead>
+                    <tr>
+                        <th>MAC Address</th>
+                        <th>Indirizzo IP</th>
+                        <th>Azione</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for mac, ip in reservations.items() %} {# 'mac' qui è già formattato con i due punti da app.py #}
+                    <tr>
+                        <td>{{ mac }}</td>
+                        <td>{{ ip }}</td>
+                        <td>
+                             <form method="POST" action="{{ url_for('remove_reservation_route') }}" style="display:inline;" onsubmit="return confirm('Sei sicuro di voler eliminare la prenotazione per {{ mac }}?');">
+                                 <input type="hidden" name="csrf_token" value="{{ form.csrf_token._value() }}">
+                                 <input type="hidden" name="mac_address" value="{{ mac }}"> {# Invia il MAC formattato, la route lo normalizzerà #}
+                                 <button type="submit" class="btn btn-danger btn-sm">
+                                     <i class="bi bi-trash"></i>
+                                 </button>
+                             </form>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="3" class="text-center">Nessuna prenotazione statica definita.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

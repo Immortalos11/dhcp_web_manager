@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Configurazione{% endblock %}
+
+{% block content %}
+<h2>Configurazione Server DHCP</h2>
+<p class="text-danger"><i class="bi bi-exclamation-triangle-fill"></i> Modificare con cautela. Impostazioni errate possono causare disservizi di rete. Il server deve essere arrestato per modificare la maggior parte delle impostazioni.</p>
+
+<form method="POST">
+    {{ form.csrf_token }}
+    <div class="row">
+        <div class="col-md-6 mb-3">
+            <label for="{{ form.interface.id }}" class="form-label fw-bold">{{ form.interface.label.text }}</label>
+            {{ form.interface(class="form-select") }}
+            <div class="form-text">Scegliere 0.0.0.0 è rischioso in reti esistenti.</div>
+        </div>
+         <div class="col-md-6 mb-3">
+            <label for="{{ form.server_ip.id }}" class="form-label fw-bold">{{ form.server_ip.label.text }}</label>
+            {{ form.server_ip(class="form-control", placeholder="Es. 192.168.1.1") }}
+        </div>
+         <div class="col-md-6 mb-3">
+            <label for="{{ form.subnet_mask.id }}" class="form-label fw-bold">{{ form.subnet_mask.label.text }}</label>
+            {{ form.subnet_mask(class="form-control", placeholder="Es. 255.255.255.0") }}
+        </div>
+         <div class="col-md-6 mb-3">
+            <label for="{{ form.gateway.id }}" class="form-label fw-bold">{{ form.gateway.label.text }}</label>
+            {{ form.gateway(class="form-control", placeholder="Es. 192.168.1.1") }}
+        </div>
+         <div class="col-md-6 mb-3">
+            <label for="{{ form.dns_servers.id }}" class="form-label fw-bold">{{ form.dns_servers.label.text }}</label>
+            {{ form.dns_servers(class="form-control", placeholder="Es. 8.8.8.8,1.1.1.1") }}
+             <div class="form-text">Separare gli indirizzi IP con una virgola.</div>
+        </div>
+         <div class="col-md-6 mb-3">
+            <label for="{{ form.lease_time.id }}" class="form-label fw-bold">{{ form.lease_time.label.text }}</label>
+            {{ form.lease_time(class="form-control", placeholder="Es. 3600") }}
+        </div>
+         <div class="col-md-6 mb-3">
+            <label for="{{ form.pool_start.id }}" class="form-label fw-bold">{{ form.pool_start.label.text }}</label>
+            {{ form.pool_start(class="form-control", placeholder="Es. 192.168.1.100") }}
+        </div>
+         <div class="col-md-6 mb-3">
+            <label for="{{ form.pool_end.id }}" class="form-label fw-bold">{{ form.pool_end.label.text }}</label>
+            {{ form.pool_end(class="form-control", placeholder="Es. 192.168.1.200") }}
+        </div>
+    </div>
+    <button type="submit" class="btn btn-primary"><i class="bi bi-save"></i> Salva Configurazione</button>
+</form>
+{% endblock %}
