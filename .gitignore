@@ -1,0 +1,88 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib60/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are created by a CI server and deployed from there.
+#  Comment out this section if you want to commit dist/ binaries.
+# *.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Environments
+.env
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Flask Session
+instance/.webassets-cache
+
+# SQLite Databases
+# Descommenta la riga sotto se NON vuoi commettere il tuo file di database.
+# È consigliato ignorarlo se contiene dati di runtime o configurazioni specifiche della macchina.
+# Se vuoi che una versione vuota o di esempio del database sia nel repo, commenta questa riga
+# o committi il db di esempio e poi aggiungi questa riga.
+dhcp_server_data.db
+# dhcp_server_data.db-journal # File temporaneo di SQLite
+# *.sqlite
+# *.sqlite3
+
+# Editor directories and files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+nbproject/
+*.komodoproject
+*.tmproj
+
+# Miscellaneous
+*.swp
+*~
+*.bak
+*.orig
