@@ -4,21 +4,18 @@
 {% block content %}
 <div class="row">
     <div class="col-lg-5">
-        <h2>Controllo Server</h2>
+        <h2>Controllo Server DHCP</h2>
         <div class="card mb-4">
             <div class="card-body">
-                <h5 class="card-title">Stato:
-                    <span id="status-badge" class="badge">CARICAMENTO...</span>
-                </h5>
-                <button id="start-button" class="btn btn-success me-2"><i class="bi bi-play-fill"></i> Avvia</button>
-                <button id="stop-button" class="btn btn-danger"><i class="bi bi-stop-fill"></i> Arresta</button>
-            </div>
+                <h5 class="card-title">Stato Server DHCP: 
+                    <span id="dhcpStatusBadge" class="badge">CARICAMENTO...</span> </h5>
+                <button id="startDhcpButton" class="btn btn-success me-2"><i class="bi bi-play-fill"></i> Avvia Server DHCP</button> <button id="stopDhcpButton" class="btn btn-danger"><i class="bi bi-stop-fill"></i> Arresta Server DHCP</button> </div>
         </div>
 
-        <h2>Log Server</h2>
+        <h2>Log Applicazione</h2>
         <div class="card">
             <div class="card-body">
-                <div id="log-box" class="bg-dark text-white p-3 rounded" style="height: 400px; overflow-y: scroll;"></div>
+                <div id="dashboardLogBox" class="bg-dark text-white p-3 rounded" style="height: 400px; overflow-y: scroll;"></div>
             </div>
         </div>
     </div>
@@ -73,235 +70,239 @@
 
 {% block scripts %}
 <script>
-    document.addEventListener('DOMContentLoaded', function() {
-        const statusBadge = document.getElementById('status-badge');
-        const startButton = document.getElementById('start-button');
-        const stopButton = document.getElementById('stop-button');
-        const leaseTableBody = document.getElementById('lease-table-body');
-        const logBox = document.getElementById('log-box');
-        
-        const pingModalElement = document.getElementById('pingModal'); // pingModal è in base.html
-        let pingModal;
-        if (pingModalElement) {
-            pingModal = new bootstrap.Modal(pingModalElement);
-        } else {
-            console.error("ERRORE: Elemento modale 'pingModal' non trovato nel DOM!");
-        }
-        const pingModalLabel = document.getElementById('pingModalLabel'); // pingModalLabel è in base.html
-        const pingResultOutput = document.getElementById('pingResultOutput'); // pingResultOutput è in base.html
+document.addEventListener('DOMContentLoaded', function() {
+    const dhcpStatusBadge = document.getElementById('dhcpStatusBadge'); 
+    const startDhcpButton = document.getElementById('startDhcpButton'); 
+    const stopDhcpButton = document.getElementById('stopDhcpButton');   
+    const leaseTableBody = document.getElementById('lease-table-body');
+    const dashboardLogBox = document.getElementById('dashboardLogBox'); 
+    
+    const pingModalElement = document.getElementById('pingModal');
+    let pingModal;
+    if (pingModalElement) {
+        pingModal = new bootstrap.Modal(pingModalElement);
+    } else {
+        console.error("ERRORE: Elemento modale 'pingModal' non trovato nel DOM!");
+    }
+    const pingModalLabel = document.getElementById('pingModalLabel'); 
+    const pingResultOutput = document.getElementById('pingResultOutput'); 
 
-        const changeIpModalElement = document.getElementById('changeIpModal');
-        let changeIpModal;
-        if (changeIpModalElement) {
-            changeIpModal = new bootstrap.Modal(changeIpModalElement);
-        } else {
-            console.error("ERRORE: Elemento modale 'changeIpModal' non trovato nel DOM!");
-        }
-        const changeIpModalMacSpan = document.getElementById('changeIpModalMac');
-        const changeIpMacHiddenInput = document.getElementById('changeIpMacHidden');
-        const newIpAddressInput = document.getElementById('newIpAddress');
-        const submitChangeIpButton = document.getElementById('submitChangeIp');
-        const changeIpErrorDiv = document.getElementById('changeIpError');
+    const changeIpModalElement = document.getElementById('changeIpModal');
+    let changeIpModal;
+    if (changeIpModalElement) {
+        changeIpModal = new bootstrap.Modal(changeIpModalElement);
+    } else {
+        console.error("ERRORE: Elemento modale 'changeIpModal' non trovato nel DOM!");
+    }
+    const changeIpModalMacSpan = document.getElementById('changeIpModalMac');
+    const changeIpMacHiddenInput = document.getElementById('changeIpMacHidden');
+    const newIpAddressInput = document.getElementById('newIpAddress');
+    const submitChangeIpButton = document.getElementById('submitChangeIp');
+    const changeIpErrorDiv = document.getElementById('changeIpError');
 
+    let logPollingInterval = null;
 
-        function updateStatus() {
-            fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
+    function updateDhcpStatus() { 
+        fetch('/api/dhcp_status') // USA L'ENDPOINT CORRETTO
+            .then(response => {
+                if (!response.ok) { throw new Error(`HTTP error! status: ${response.status}`); }
+                return response.json();
+            })
+            .then(data => {
+                if (dhcpStatusBadge) { // Controlla se l'elemento esiste
                     if (data.running) {
-                        statusBadge.textContent = 'ATTIVO';
-                        statusBadge.className = 'badge bg-success status-badge';
-                        startButton.disabled = true;
-                        stopButton.disabled = false;
+                        dhcpStatusBadge.textContent = 'ATTIVO';
+                        dhcpStatusBadge.className = 'badge bg-success status-badge';
+                        if(startDhcpButton) startDhcpButton.disabled = true;
+                        if(stopDhcpButton) stopDhcpButton.disabled = false;
                     } else {
-                        statusBadge.textContent = 'ARRESTATO';
-                        statusBadge.className = 'badge bg-danger status-badge';
-                        startButton.disabled = false;
-                        stopButton.disabled = true;
+                        dhcpStatusBadge.textContent = 'ARRESTATO';
+                        dhcpStatusBadge.className = 'badge bg-danger status-badge';
+                        if(startDhcpButton) startDhcpButton.disabled = false;
+                        if(stopDhcpButton) stopDhcpButton.disabled = true;
                     }
-                })
-                .catch(err => {
-                    statusBadge.textContent = 'ERRORE';
-                    statusBadge.className = 'badge bg-warning status-badge';
-                    console.error("Errore fetch status:", err);
-                });
-        }
-
-        function updateLeases() {
-            fetch('/api/leases')
-                .then(response => response.json())
-                .then(data => {
-                    leaseTableBody.innerHTML = '';
-                    if (data.length === 0) {
-                         leaseTableBody.innerHTML = '<tr><td colspan="6" class="text-center">Nessun lease attivo.</td></tr>';
-                         return;
-                    }
-                    data.forEach(lease => {
-                        const row = document.createElement('tr');
-                        const isExpired = new Date(lease.end_time * 1000) < new Date();
-                        row.innerHTML = `
-                            <td>${lease.mac}</td>
-                            <td>${lease.ip}</td>
-                            <td>${lease.hostname || 'N/A'}</td>
-                            <td class="${isExpired ? 'text-danger' : ''}">${new Date(lease.end_time * 1000).toLocaleString('it-IT')} ${isExpired ? '(Scaduto)' : ''}</td>
-                            <td><span class="badge ${lease.is_static ? 'bg-primary' : 'bg-secondary'}">${lease.is_static ? 'Statico' : 'Dinamico'}</span></td>
-                            <td>
-                                <button class="btn btn-sm btn-info ping-btn" data-ip="${lease.ip}" title="Ping ${lease.ip}"><i class="bi bi-reception-4"></i></button>
-                                <button class="btn btn-sm btn-warning change-ip-btn" data-mac="${lease.mac}" data-current-ip="${lease.ip}" title="Cambia/Imposta IP per ${lease.mac}"><i class="bi bi-pencil-square"></i></button>
-                                <a href="ssh://root@${lease.ip}" target="_blank" class="btn btn-sm btn-secondary ssh-btn" title="SSH come root a ${lease.ip} (richiede client SSH e OS configurato)">
-                                    <i class="bi bi-terminal"></i> SSH
-                                </a>
-                            </td>
-                        `;
-                        leaseTableBody.appendChild(row);
-                    });
-                })
-                .catch(err => console.error("Errore fetch leases:", err));
-        }
-
-        function updateLogs() {
-            fetch('/api/logs')
-                .then(response => response.json())
-                .then(data => {
-                    logBox.innerHTML = '';
-                    data.forEach(log => {
-                       const line = document.createElement('div');
-                       line.className = 'log-line';
-                       let color = 'white';
-                       if (log.level === 'WARNING') color = 'yellow';
-                       else if (log.level === 'ERROR' || log.level === 'CRITICAL') color = 'red';
-                       else if (log.level === 'INFO') color = '#88ddff';
-                       line.style.color = color;
-                       line.textContent = `${log.time} - ${log.level} - ${log.message}`;
-                       logBox.appendChild(line);
-                    });
-                    logBox.scrollTop = logBox.scrollHeight;
-                })
-                .catch(err => console.error("Errore fetch logs:", err));
-        }
-
-        function doPing(ip) {
-            if (!pingModal) { // pingModal è definito da base.html
-                alert("Errore: La finestra modale per il ping non è inizializzata (pingModal non trovato).");
-                console.error("Tentativo di usare pingModal prima dell'inizializzazione o se l'elemento non è stato trovato.");
-                return;
-            }
-            if (pingModalLabel && pingResultOutput) { // Controlla che anche gli elementi interni della modale esistano
-                pingModalLabel.textContent = `Risultato Ping per ${ip}`;
-                pingResultOutput.textContent = `Esecuzione ping verso ${ip}... Attendere...`;
-                pingResultOutput.classList.remove('text-danger');
-            } else {
-                console.error("Elementi interni della modale ping (label o output) non trovati.");
-                return;
-            }
-            pingModal.show();
-
-            fetch(`/api/ping/${ip}`)
-                .then(response => response.json())
-                .then(data => {
-                    if(pingResultOutput) pingResultOutput.textContent = data.output;
-                    if (data.status === 'error' && pingResultOutput) {
-                         pingResultOutput.classList.add('text-danger');
-                    }
-                })
-                .catch(err => {
-                    if(pingResultOutput) {
-                        pingResultOutput.textContent = `Errore di rete nella richiesta di ping:\n${err}`;
-                        pingResultOutput.classList.add('text-danger');
-                    }
-                });
-        }
-
-        function openChangeIpModal(mac, currentIp) {
-            if (!changeIpModal) {
-                alert("Errore: La finestra modale per cambiare IP non è inizializzata.");
-                return;
-            }
-            if (changeIpModalMacSpan) changeIpModalMacSpan.textContent = mac;
-            if (changeIpMacHiddenInput) changeIpMacHiddenInput.value = mac; 
-            if (newIpAddressInput) newIpAddressInput.value = currentIp; 
-            if (changeIpErrorDiv) changeIpErrorDiv.textContent = ''; 
-            changeIpModal.show();
-        }
-
-        if(submitChangeIpButton) {
-            submitChangeIpButton.addEventListener('click', function() {
-                const mac = changeIpMacHiddenInput.value;
-                const newIp = newIpAddressInput.value;
-                if(changeIpErrorDiv) changeIpErrorDiv.textContent = '';
-
-                if (!newIp) {
-                    if(changeIpErrorDiv) changeIpErrorDiv.textContent = 'Il nuovo indirizzo IP è richiesto.';
-                    return;
                 }
-
-                fetch('/api/set_lease_ip', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ mac_address: mac, new_ip_address: newIp })
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'ok') {
-                        if(changeIpModal) changeIpModal.hide();
-                        window.location.reload(); 
-                    } else {
-                        if(changeIpErrorDiv) changeIpErrorDiv.textContent = data.message || 'Errore durante l\'impostazione del nuovo IP.';
-                    }
-                })
-                .catch(err => {
-                    console.error('Errore fetch set_lease_ip:', err);
-                    if(changeIpErrorDiv) changeIpErrorDiv.textContent = 'Errore di rete durante l\'impostazione del nuovo IP.';
-                });
+            })
+            .catch(err => {
+                if (dhcpStatusBadge) {
+                    dhcpStatusBadge.textContent = 'ERRORE';
+                    dhcpStatusBadge.className = 'badge bg-warning status-badge';
+                }
+                console.error("Errore fetch stato DHCP:", err);
             });
+    }
+
+    function updateLeases() {
+        fetch('/api/leases')
+            .then(response => response.json())
+            .then(data => {
+                leaseTableBody.innerHTML = '';
+                if (data.length === 0) {
+                     leaseTableBody.innerHTML = '<tr><td colspan="6" class="text-center">Nessun lease attivo.</td></tr>';
+                     return;
+                }
+                data.forEach(lease => {
+                    const row = document.createElement('tr');
+                    const isExpired = new Date(lease.end_time * 1000) < new Date();
+                    row.innerHTML = `
+                        <td>${lease.mac}</td>
+                        <td>${lease.ip}</td>
+                        <td>${lease.hostname || 'N/A'}</td>
+                        <td class="${isExpired ? 'text-danger' : ''}">${new Date(lease.end_time * 1000).toLocaleString('it-IT')} ${isExpired ? '(Scaduto)' : ''}</td>
+                        <td><span class="badge ${lease.is_static ? 'bg-primary' : 'bg-secondary'}">${lease.is_static ? 'Statico' : 'Dinamico'}</span></td>
+                        <td>
+                            <button class="btn btn-sm btn-info ping-btn" data-ip="${lease.ip}" title="Ping ${lease.ip}"><i class="bi bi-reception-4"></i></button>
+                            <button class="btn btn-sm btn-warning change-ip-btn" data-mac="${lease.mac}" data-current-ip="${lease.ip}" title="Cambia/Imposta IP per ${lease.mac}"><i class="bi bi-pencil-square"></i></button>
+                            <a href="ssh://root@${lease.ip}" target="_blank" class="btn btn-sm btn-secondary ssh-btn" title="SSH come root a ${lease.ip} (richiede client SSH e OS configurato)">
+                                <i class="bi bi-terminal"></i> SSH
+                            </a>
+                        </td>
+                    `;
+                    leaseTableBody.appendChild(row);
+                });
+            })
+            .catch(err => console.error("Errore fetch leases:", err));
+    }
+
+    function updateDashboardLogs() { 
+        if (!dashboardLogBox) return;
+        fetch('/api/logs')
+            .then(response => response.json())
+            .then(data => {
+                dashboardLogBox.innerHTML = '';
+                data.forEach(log => {
+                   const line = document.createElement('div');
+                   line.className = 'log-line';
+                   let color = 'white';
+                   if (log.level === 'WARNING') color = 'yellow';
+                   else if (log.level === 'ERROR' || log.level === 'CRITICAL') color = 'red';
+                   else if (log.level === 'INFO') color = '#88ddff';
+                   line.style.color = color;
+                   line.textContent = `${log.time} - ${log.level} - ${log.message}`;
+                   dashboardLogBox.appendChild(line);
+                });
+                dashboardLogBox.scrollTop = dashboardLogBox.scrollHeight;
+            })
+            .catch(err => console.error("Errore fetch logs per dashboard:", err));
+    }
+
+    function doPing(ip) {
+        if (!pingModal || !pingModalLabel || !pingResultOutput) {
+            console.error("Elementi della modale Ping non trovati.");
+            alert("Errore: la finestra modale per il ping non è disponibile.");
+            return;
         }
-        
+        pingModalLabel.textContent = `Risultato Ping per ${ip}`;
+        pingResultOutput.textContent = `Esecuzione ping verso ${ip}... Attendere...`;
+        pingResultOutput.classList.remove('text-danger');
+        pingModal.show();
+        fetch(`/api/ping/${ip}`)
+            .then(response => response.json())
+            .then(data => {
+                pingResultOutput.textContent = data.output;
+                if (data.status === 'error') {
+                     pingResultOutput.classList.add('text-danger');
+                }
+            })
+            .catch(err => {
+                pingResultOutput.textContent = `Errore di rete nella richiesta di ping:\n${err}`;
+                pingResultOutput.classList.add('text-danger');
+            });
+    }
+
+    function openChangeIpModal(mac, currentIp) {
+        if (!changeIpModal || !changeIpModalMacSpan || !changeIpMacHiddenInput || !newIpAddressInput || !changeIpErrorDiv) {
+            console.error("Elementi della modale Cambia IP non trovati.");
+            alert("Errore: la finestra modale per cambiare IP non è disponibile.");
+            return;
+        }
+        changeIpModalMacSpan.textContent = mac;
+        changeIpMacHiddenInput.value = mac; 
+        newIpAddressInput.value = currentIp; 
+        changeIpErrorDiv.textContent = ''; 
+        changeIpModal.show();
+    }
+
+    if(submitChangeIpButton) {
+        submitChangeIpButton.addEventListener('click', function() {
+            const mac = changeIpMacHiddenInput.value;
+            const newIp = newIpAddressInput.value;
+            if(changeIpErrorDiv) changeIpErrorDiv.textContent = '';
+            if (!newIp) {
+                if(changeIpErrorDiv) changeIpErrorDiv.textContent = 'Il nuovo indirizzo IP è richiesto.';
+                return;
+            }
+            fetch('/api/set_lease_ip', { 
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ mac_address: mac, new_ip_address: newIp })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    if(changeIpModal) changeIpModal.hide();
+                    window.location.reload(); 
+                } else {
+                    if(changeIpErrorDiv) changeIpErrorDiv.textContent = data.message || 'Errore durante l\'impostazione del nuovo IP.';
+                }
+            })
+            .catch(err => {
+                console.error('Errore fetch set_lease_ip:', err);
+                if(changeIpErrorDiv) changeIpErrorDiv.textContent = 'Errore di rete durante l\'impostazione del nuovo IP.';
+            });
+        });
+    }
+    
+    if (leaseTableBody) { // Aggiunto controllo
         leaseTableBody.addEventListener('click', (event) => {
             const pingButton = event.target.closest('.ping-btn');
             const changeIpButton = event.target.closest('.change-ip-btn');
-
             if (pingButton) {
                 event.preventDefault();
                 const ipToPing = pingButton.dataset.ip;
-                if (ipToPing) {
-                    doPing(ipToPing);
-                }
+                if (ipToPing) { doPing(ipToPing); }
             } else if (changeIpButton) {
                 event.preventDefault();
                 const macToChange = changeIpButton.dataset.mac;
                 const currentIp = changeIpButton.dataset.currentIp;
-                if (macToChange) {
-                    openChangeIpModal(macToChange, currentIp);
-                }
+                if (macToChange) { openChangeIpModal(macToChange, currentIp); }
             }
         });
+    }
 
-        startButton.addEventListener('click', () => {
-            startButton.disabled = true;
-            fetch('/api/start', { method: 'POST' })
+    if (startDhcpButton) { // Aggiunto controllo
+        startDhcpButton.addEventListener('click', () => { 
+            startDhcpButton.disabled = true;
+            fetch('/api/start_dhcp', { method: 'POST' }) 
                 .then(response => response.json())
                 .then(data => {
-                    if (data.status !== 'ok') { alert("Errore avvio server: " + data.message); }
-                    setTimeout(updateStatus, 1500);
+                    if (data.status !== 'ok') { alert("Errore avvio server DHCP: " + data.message); }
+                    setTimeout(updateDhcpStatus, 500); 
                 })
-                .catch(err => { alert("Errore di rete nell'avvio del server."); updateStatus(); });
+                .catch(err => { alert("Errore di rete nell'avvio del server DHCP."); updateDhcpStatus(); });
         });
+    }
 
-        stopButton.addEventListener('click', () => {
-            stopButton.disabled = true;
-            fetch('/api/stop', { method: 'POST' })
-                 .then(() => setTimeout(updateStatus, 1500));
+    if (stopDhcpButton) { // Aggiunto controllo
+        stopDhcpButton.addEventListener('click', () => { 
+            stopDhcpButton.disabled = true;
+            fetch('/api/stop_dhcp', { method: 'POST' }) 
+                 .then(() => setTimeout(updateDhcpStatus, 500)); 
         });
+    }
 
-        updateStatus();
-        updateLeases();
-        updateLogs();
-        setInterval(updateStatus, 3000);
-        setInterval(updateLeases, 5000);
-        setInterval(updateLogs, 2500);
+    updateDhcpStatus(); 
+    updateLeases();
+    updateDashboardLogs(); 
+    setInterval(updateDhcpStatus, 3000); 
+    setInterval(updateLeases, 5000);
+    if (!logPollingInterval) { // Evita di creare multipli intervalli
+        logPollingInterval = setInterval(updateDashboardLogs, 3000); 
+    }
 
-    }); 
+    window.addEventListener('beforeunload', () => {
+        if (logPollingInterval) clearInterval(logPollingInterval);
+    });
+});
 </script>
 {% endblock %}

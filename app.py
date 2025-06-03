@@ -1,4 +1,3 @@
-import os
 import sys
 import socket
 import sqlite3
@@ -8,29 +7,34 @@ import logging
 import psutil
 import threading
 import subprocess
+import os
+import struct # Per il parsing manuale BOOTP
 from ipaddress import IPv4Address, IPv4Network, ip_address
 
 from dhcppython.packet import DHCPPacket
 from dhcppython import options
+from dhcppython.exceptions import MalformedPacketError, DHCPValueError
 
-from flask import (Flask, render_template, request, jsonify, flash, redirect, url_for)
+from flask import (Flask, render_template, request, jsonify, flash, 
+                   redirect, url_for, session, get_flashed_messages)
 from flask_wtf import FlaskForm
 from wtforms import StringField, IntegerField, SelectField, SubmitField
 from wtforms.validators import DataRequired, IPAddress, MacAddress, NumberRange, Optional
 
+
 # Importa network_tools e gestisce la sua disponibilità
 try:
-    from network_tools import scan_network_for_devices
+    from network_tools import scan_network_for_devices 
     network_tools_available = True
 except ImportError:
     network_tools_available = False
     print("ATTENZIONE: Modulo 'network_tools.py' non trovato. La funzionalità di Scoperta Rete non sarà disponibile.")
 
-
 # --- Mappa dei tipi DHCP per logging ---
 DHCP_TYPE_MAP = {
     1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 4: "DECLINE", 
     5: "ACK", 6: "NAK", 7: "RELEASE", 8: "INFORM",
+    101: "BOOTREQUEST (BOOTP)", 102: "BOOTREPLY (BOOTP)" # Per logging BOOTP
 }
 DHCP_MESSAGE_TYPE_STR_MAP = {
     1: "DHCPDISCOVER", 2: "DHCPOFFER", 3: "DHCPREQUEST", 4: "DHCPDECLINE",
@@ -51,8 +55,8 @@ scan_lock = threading.Lock()
 
 # --- Configurazione Logging ---
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('dhcp_server') # Logger principale per l'app
-logger.setLevel(logging.INFO) 
+logger = logging.getLogger('dhcp_server')
+logger.setLevel(logging.INFO)
 if logger.hasHandlers():
     logger.handlers.clear()
 console_handler = logging.StreamHandler(sys.stdout)
@@ -60,14 +64,10 @@ console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
 # --- Database ---
-# DB_FILE = "dhcp_server_data.db" # Vecchia riga
-DATABASE_DIR = "/data" # Directory per i dati persistenti nel container
+DATABASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 DB_FILE = os.environ.get('DATABASE_FILE_PATH', os.path.join(DATABASE_DIR, 'dhcp_server_data.db'))
 
-# Assicurati che la directory /data esista se non usiamo un volume subito
-# (anche se con i volumi Docker la crea automaticamente sull'host se non esiste)
-# Questa parte è più per esecuzione locale o se il volume non è montato la prima volta
-if not os.path.exists(DATABASE_DIR) and os.environ.get('DATABASE_FILE_PATH'):
+if not os.path.exists(DATABASE_DIR):
     try:
         os.makedirs(DATABASE_DIR)
         logger.info(f"Creata directory per database: {DATABASE_DIR}")
@@ -78,6 +78,13 @@ def get_db_conn():
     return sqlite3.connect(DB_FILE, check_same_thread=False)
 
 def init_db():
+    if not os.path.exists(DATABASE_DIR):
+        try:
+            os.makedirs(DATABASE_DIR)
+            logger.info(f"Creata directory per database in init_db: {DATABASE_DIR}")
+        except OSError as e:
+            logger.error(f"Impossibile creare directory per database {DATABASE_DIR} in init_db: {e}")
+            
     conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute('CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)')
@@ -101,9 +108,7 @@ class DatabaseLogger(logging.Handler):
         conn = get_db_conn()
         cursor = conn.cursor()
         try:
-            # Usa il formattatore del logger principale per consistenza
             msg = logger.handlers[0].formatter.format(record) if logger.handlers else record.getMessage()
-            # Estrai solo il messaggio effettivo se il formattatore standard è usato
             msg_only = msg.split(' - ', 2)[-1] if ' - ' in msg and len(msg.split(' - ', 2)) == 3 else msg
             
             cursor.execute("INSERT INTO logs (timestamp, level, message) VALUES (?, ?, ?)",
@@ -111,13 +116,12 @@ class DatabaseLogger(logging.Handler):
             cursor.execute("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY timestamp DESC LIMIT 500)")
             conn.commit()
         except Exception as e:
-            print(f"Errore logging DB: {e}") # Errore critico, stampa su console
+            print(f"Errore logging DB: {e}")
         finally:
-            if conn:
-                conn.close()
+            if conn: conn.close()
 
 db_log_handler = DatabaseLogger()
-db_log_handler.setFormatter(log_formatter) # Usa lo stesso formattatore
+db_log_handler.setFormatter(log_formatter)
 logger.addHandler(db_log_handler)
 
 def get_config(key, default=None):
@@ -128,7 +132,7 @@ def get_config(key, default=None):
     conn.close()
     return row[0] if row else default
 
-def set_config(key, value):
+def set_config_value(key, value):
     conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
@@ -143,19 +147,19 @@ def normalize_mac(mac_string):
             return mac_string.decode('utf-8').replace(":", "").replace("-", "").lower().strip()
         except UnicodeDecodeError:
             return "".join([f"{b:02x}" for b in mac_string]).lower()
-    return mac_string 
+    return mac_string
 
 def format_mac_for_display(mac_input_str):
     normalized = normalize_mac(mac_input_str)
     if isinstance(normalized, str) and len(normalized) == 12:
         try:
-            int(normalized, 16) # Valida se è esadecimale
+            int(normalized, 16)
             return ":".join(normalized[i:i+2] for i in range(0, 12, 2))
         except ValueError:
-            return mac_input_str # Ritorna l'input se la normalizzazione fallisce
+            return mac_input_str
     return mac_input_str
 
-def get_static_reservations():
+def get_static_reservations_from_db():
     conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT mac_address, ip_address FROM static_reservations ORDER BY ip_address")
@@ -163,46 +167,44 @@ def get_static_reservations():
     conn.close()
     return {normalize_mac(r[0]): r[1] for r in rows if normalize_mac(r[0])}
 
-
-def add_static_reservation(mac, ip_str_new):
+def add_static_reservation_to_db(mac, ip_str_new):
     conn = get_db_conn()
     cursor = conn.cursor()
     original_mac_input = mac
     normalized_mac_target = normalize_mac(mac)
+    warning_msg_for_flash = None
     
     try:
         new_ip_obj = IPv4Address(ip_str_new)
     except ValueError:
+        msg = f"L'indirizzo IP '{ip_str_new}' non è valido."
         logger.error(f"Tentativo di aggiungere prenotazione con IP non valido: {ip_str_new}")
-        flash(f"L'indirizzo IP '{ip_str_new}' non è valido.", "danger")
-        return False
+        return False, msg, "danger"
 
     if not normalized_mac_target or len(normalized_mac_target) != 12:
-        logger.error(f"Formato MAC non valido dopo normalizzazione per prenotazione: '{original_mac_input}' -> '{normalized_mac_target}'")
-        flash(f"Il formato del MAC address '{original_mac_input}' non è valido.", "danger")
-        return False
+        msg = f"Il formato del MAC address '{original_mac_input}' non è valido."
+        logger.error(f"Formato MAC non valido dopo normalizzazione: '{original_mac_input}' -> '{normalized_mac_target}'")
+        return False, msg, "danger"
     try:
         query_check_reservation = "SELECT mac_address FROM static_reservations WHERE ip_address = ? AND mac_address != ?"
         cursor.execute(query_check_reservation, (str(new_ip_obj), normalized_mac_target))
         existing_reservation_for_ip_row = cursor.fetchone()
-        
         if existing_reservation_for_ip_row:
             conflicting_mac_normalized = normalize_mac(existing_reservation_for_ip_row[0])
-            logger.error(f"Errore: IP {new_ip_obj} è già prenotato staticamente per MAC {format_mac_for_display(conflicting_mac_normalized)}.")
-            flash(f"L'IP {new_ip_obj} è già prenotato staticamente per un altro MAC: {format_mac_for_display(conflicting_mac_normalized)}.", "danger")
-            if conn: conn.close() 
-            return False
+            msg = f"L'IP {new_ip_obj} è già prenotato staticamente per MAC {format_mac_for_display(conflicting_mac_normalized)}."
+            logger.error(msg)
+            if conn: conn.close()
+            return False, msg, "danger"
         
         query_check_lease = "SELECT mac_address FROM leases WHERE ip_address = ? AND mac_address != ? AND is_static = 0 AND lease_end_time > ?"
         cursor.execute(query_check_lease, (str(new_ip_obj), normalized_mac_target, int(time.time())))
         active_dynamic_lease_for_ip_row = cursor.fetchone()
         if active_dynamic_lease_for_ip_row:
             conflicting_mac_normalized = normalize_mac(active_dynamic_lease_for_ip_row[0])
-            logger.warning(f"Attenzione: IP {new_ip_obj} è attualmente un lease dinamico attivo per MAC {format_mac_for_display(conflicting_mac_normalized)}. Creando una prenotazione statica si potrebbe causare un conflitto temporaneo.")
-            flash(f"Attenzione: l'IP {new_ip_obj} è attualmente un lease dinamico attivo per MAC {format_mac_for_display(conflicting_mac_normalized)}. La prenotazione statica verrà creata, ma potrebbe esserci un conflitto temporaneo. Il dispositivo {format_mac_for_display(conflicting_mac_normalized)} dovrà rilasciare/rinnovare il suo IP.", "warning")
+            warning_msg_for_flash = f"Attenzione: l'IP {new_ip_obj} è attualmente un lease dinamico attivo per MAC {format_mac_for_display(conflicting_mac_normalized)}. La prenotazione statica verrà creata, ma potrebbe esserci un conflitto temporaneo."
+            logger.warning(warning_msg_for_flash)
 
         cursor.execute("INSERT OR REPLACE INTO static_reservations (mac_address, ip_address) VALUES (?, ?)", (normalized_mac_target, str(new_ip_obj)))
-        
         cursor.execute("SELECT ip_address, is_static FROM leases WHERE mac_address = ?", (normalized_mac_target,))
         current_lease_row = cursor.fetchone()
         if current_lease_row:
@@ -214,47 +216,45 @@ def add_static_reservation(mac, ip_str_new):
             elif not is_lease_static :
                  logger.info(f"MAC {format_mac_for_display(normalized_mac_target)} ha già {current_leased_ip_for_target_mac} (dinamico). Il lease verrà aggiornato a statico.")
                  cursor.execute("UPDATE leases SET is_static = 1 WHERE mac_address = ?", (normalized_mac_target,))
-        
         conn.commit()
+        
+        success_msg = f"Prenotazione per MAC {format_mac_for_display(original_mac_input)} impostata/aggiornata a {new_ip_obj}."
         logger.info(f"Aggiunta/Aggiornata prenotazione: MAC_NORM='{normalized_mac_target}' (Originale:'{format_mac_for_display(original_mac_input)}') = {new_ip_obj}")
-        return True
+        
+        if warning_msg_for_flash:
+            return True, warning_msg_for_flash + " " + success_msg, "warning"
+        return True, success_msg, "success"
+        
     except sqlite3.Error as e:
+        msg = f"Errore Database: {e}"
         logger.error(f"Errore DB aggiungendo prenotazione MAC='{original_mac_input}', IP='{ip_str_new}': {e}")
-        flash(f"Errore Database: {e}", "danger")
-        return False
+        return False, msg, "danger"
     finally:
-        if conn:
-            conn.close()
+        if conn: conn.close()
 
-def remove_static_reservation(mac):
+def remove_static_reservation_from_db(mac):
     conn = get_db_conn()
     cursor = conn.cursor()
     original_mac_input = mac
     normalized_mac = normalize_mac(mac)
-    
     logger.info(f"Tentativo di rimozione prenotazione. Input originale: '{format_mac_for_display(original_mac_input)}', Normalizzato a: '{normalized_mac}'")
-    
     rows_affected = 0 
     try:
         cursor.execute("DELETE FROM static_reservations WHERE mac_address = ?", (normalized_mac,))
         rows_affected = cursor.rowcount 
         conn.commit()
-        
         if rows_affected > 0:
-            logger.info(f"Prenotazione per MAC_NORM='{normalized_mac}' (Originale:'{format_mac_for_display(original_mac_input)}') RIMOSSA con successo. Righe modificate: {rows_affected}")
+            logger.info(f"Prenotazione RIMOSSA. Righe: {rows_affected}")
         else:
-            logger.warning(f"Nessuna prenotazione trovata nel DB per MAC_NORM='{normalized_mac}' (Originale:'{format_mac_for_display(original_mac_input)}') durante il tentativo di rimozione. Righe modificate: {rows_affected}")
-
+            logger.warning(f"Nessuna prenotazione trovata per rimozione. Righe: {rows_affected}")
     except sqlite3.Error as e:
-        logger.error(f"Errore DB durante la rimozione della prenotazione per MAC='{format_mac_for_display(original_mac_input)}': {e}")
-        if conn:
-            conn.rollback() 
+        logger.error(f"Errore DB rimozione prenotazione MAC='{original_mac_input}': {e}")
+        if conn: conn.rollback() 
     finally:
-        if conn:
-            conn.close()
+        if conn: conn.close()
     return rows_affected
 
-def get_all_leases():
+def get_all_leases_from_db():
     conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT mac_address, ip_address, lease_end_time, hostname, is_static FROM leases ORDER BY ip_address")
@@ -281,7 +281,7 @@ class DhcpServerThread(threading.Thread):
 
     def load_config(self):
         try:
-            raw_static_reservations = get_static_reservations()
+            raw_static_reservations = get_static_reservations_from_db()
             current_static_reservations = {
                 normalize_mac(k): IPv4Address(v) for k, v in raw_static_reservations.items() if normalize_mac(k)
             }
@@ -311,7 +311,7 @@ class DhcpServerThread(threading.Thread):
         conn.close()
         return row
 
-    def _get_lease_by_ip(self, ip):
+    def _get_lease_by_ip(self, ip): 
         conn = get_db_conn()
         cursor = conn.cursor()
         cursor.execute("SELECT mac_address, lease_end_time FROM leases WHERE ip_address = ?", (str(ip),))
@@ -395,28 +395,18 @@ class DhcpServerThread(threading.Thread):
         opt_list.append(options.options.short_value_to_object(51, self.config['lease_time']))
         opt_list.append(options.options.short_value_to_object(54, str(self.config['server_ip'])))
 
-        offer = DHCPPacket(
+        offer_packet = DHCPPacket(
             op="BOOTREPLY", 
-            htype=packet.htype,
-            hlen=packet.hlen,
-            hops=0,
-            xid=packet.xid,
-            secs=0,
-            flags=packet.flags,
-            ciaddr=IPv4Address('0.0.0.0'),
-            yiaddr=offered_ip,
-            siaddr=self.config['server_ip'],
-            giaddr=IPv4Address('0.0.0.0'),
-            chaddr=packet.chaddr,
-            sname=b'',
-            file=b'',
+            htype=packet.htype, hlen=packet.hlen, hops=0, xid=packet.xid, secs=0, flags=packet.flags,
+            ciaddr=IPv4Address('0.0.0.0'), yiaddr=offered_ip, siaddr=self.config['server_ip'],
+            giaddr=IPv4Address('0.0.0.0'), chaddr=packet.chaddr, sname=b'', file=b'',
             options=opt_list
         )
-        return offer
+        return offer_packet
 
     def _handle_request(self, packet, client_mac_normalized):
-        requested_ip_opt = packet.options.by_code(50)
-        server_id_opt = packet.options.by_code(54)
+        requested_ip_opt = packet.options.by_code(50) 
+        server_id_opt = packet.options.by_code(54)   
         
         if server_id_opt and IPv4Address(server_id_opt.data) != self.config['server_ip']:
             logger.debug(f"Richiesta per un altro server ID ({IPv4Address(server_id_opt.data)}), ignorata.")
@@ -465,25 +455,14 @@ class DhcpServerThread(threading.Thread):
             opt_list_ack.append(options.options.short_value_to_object(51, self.config['lease_time']))
             opt_list_ack.append(options.options.short_value_to_object(54, str(self.config['server_ip'])))
 
-            ack = DHCPPacket(
-                op="BOOTREPLY",
-                htype=packet.htype,
-                hlen=packet.hlen,
-                hops=0,
-                xid=packet.xid,
-                secs=0,
-                flags=packet.flags,
-                ciaddr=requested_ip, 
-                yiaddr=requested_ip,
-                siaddr=self.config['server_ip'],
+            ack_packet = DHCPPacket(
+                op="BOOTREPLY", htype=packet.htype, hlen=packet.hlen, hops=0, xid=packet.xid, secs=0, flags=packet.flags,
+                ciaddr=requested_ip, yiaddr=requested_ip, siaddr=self.config['server_ip'],
                 giaddr=packet.giaddr if packet.giaddr != IPv4Address('0.0.0.0') else IPv4Address('0.0.0.0'),
-                chaddr=packet.chaddr,
-                sname=b'',
-                file=b'',
-                options=opt_list_ack
+                chaddr=packet.chaddr, sname=b'', file=b'', options=opt_list_ack
             )
             logger.info(f"ACK: {format_mac_for_display(client_mac_normalized)} -> {requested_ip}")
-            return ack
+            return ack_packet
         else: 
             logger.warning(f"Invio NAK a {format_mac_for_display(client_mac_normalized)} per IP {requested_ip}")
             
@@ -491,24 +470,43 @@ class DhcpServerThread(threading.Thread):
             opt_list_nak.append(options.options.short_value_to_object(53, DHCP_MESSAGE_TYPE_STR_MAP[6]))
             opt_list_nak.append(options.options.short_value_to_object(54, str(self.config['server_ip'])))
 
-            nak = DHCPPacket(
-                op="BOOTREPLY",
-                htype=packet.htype,
-                hlen=packet.hlen,
-                hops=0,
-                xid=packet.xid,
-                secs=0,
-                flags=packet.flags, 
-                ciaddr=IPv4Address('0.0.0.0'),
-                yiaddr=IPv4Address('0.0.0.0'),
-                siaddr=IPv4Address('0.0.0.0'),
+            nak_packet = DHCPPacket(
+                op="BOOTREPLY", htype=packet.htype, hlen=packet.hlen, hops=0, xid=packet.xid, secs=0, flags=packet.flags, 
+                ciaddr=IPv4Address('0.0.0.0'), yiaddr=IPv4Address('0.0.0.0'), siaddr=IPv4Address('0.0.0.0'),
                 giaddr=packet.giaddr if packet.giaddr != IPv4Address('0.0.0.0') else IPv4Address('0.0.0.0'),
-                chaddr=packet.chaddr,
-                sname=b'',
-                file=b'',
-                options=opt_list_nak
+                chaddr=packet.chaddr, sname=b'', file=b'', options=opt_list_nak
             )
-            return nak
+            return nak_packet
+
+    def _handle_bootp_request(self, op, htype, hlen, xid, chaddr_bytes, giaddr_ip, client_addr_tuple):
+        client_mac_normalized = normalize_mac(chaddr_bytes[:hlen])
+        logger.info(f"Ricevuto BOOTREQUEST (BOOTP) da MAC: {format_mac_for_display(client_mac_normalized)} da {client_addr_tuple}")
+
+        if client_mac_normalized in self.config['static_reservations']:
+            assigned_ip = self.config['static_reservations'][client_mac_normalized]
+            logger.info(f"BOOTREPLY (BOOTP): Offrendo IP {assigned_ip} a MAC {format_mac_for_display(client_mac_normalized)} (da prenotazione)")
+
+            boot_reply = DHCPPacket(
+                op="BOOTREPLY", 
+                htype=htype, 
+                hlen=hlen,
+                hops=0,
+                xid=xid,
+                secs=0, 
+                flags=0, 
+                ciaddr=IPv4Address('0.0.0.0'), 
+                yiaddr=assigned_ip, 
+                siaddr=self.config['server_ip'], 
+                giaddr=giaddr_ip, 
+                chaddr=format_mac_for_display(client_mac_normalized), 
+                sname=b'', 
+                file=b'',  
+                options=options.OptionList([options.options.short_value_to_object(255, None)])
+            )
+            return boot_reply
+        else:
+            logger.warning(f"Nessuna prenotazione statica trovata per BOOTREQUEST da MAC {format_mac_for_display(client_mac_normalized)}. Richiesta ignorata.")
+            return None
 
     def run(self):
         if not self.load_config():
@@ -532,37 +530,84 @@ class DhcpServerThread(threading.Thread):
             return
 
         while self._running.is_set():
-            try:
+            try: 
                 data, addr = self.sock.recvfrom(1024)
-                packet = DHCPPacket.from_bytes(data)
-                msg_type_opt = packet.options.by_code(53)
-                if not msg_type_opt: continue
-
-                msg_type_code = msg_type_opt.data[0]
-                msg_type_name = DHCP_TYPE_MAP.get(msg_type_code, f"UNKNOWN({msg_type_code})")
                 
-                client_mac_normalized = normalize_mac(packet.chaddr) 
+                magic_cookie_offset = 236
+                expected_magic_cookie = b'\x63\x82\x53\x63'
+
+                if len(data) > magic_cookie_offset + 4 and data[magic_cookie_offset:magic_cookie_offset+4] == expected_magic_cookie:
+                    try:
+                        packet = DHCPPacket.from_bytes(data)
+                    except MalformedPacketError as mpe:
+                        logger.warning(f"Pacchetto DHCP malformato (nonostante magic cookie) da {addr}: {mpe}. Dati: {data!r}")
+                        continue
+                    except Exception as e_parse:
+                        logger.error(f"Errore imprevisto parsing pacchetto DHCP da {addr}: {e_parse}. Dati: {data!r}", exc_info=True)
+                        continue
+
+                    msg_type_opt = packet.options.by_code(53)
+                    if not msg_type_opt: 
+                        logger.warning(f"Pacchetto DHCP da {addr} senza opzione DHCP Message Type (53), ignorato.")
+                        continue
+
+                    msg_type_code = msg_type_opt.data[0]
+                    msg_type_name = DHCP_TYPE_MAP.get(msg_type_code, f"UNKNOWN_DHCP({msg_type_code})")
+                    client_mac_normalized = normalize_mac(packet.chaddr)
+                    logger.info(f"Ricevuto {msg_type_name} da MAC: {format_mac_for_display(client_mac_normalized)} (Originale: {packet.chaddr}) da {addr}")
+
+                    response = None
+                    if msg_type_code == 1: 
+                        response = self._handle_discover(packet, client_mac_normalized)
+                    elif msg_type_code == 3: 
+                        response = self._handle_request(packet, client_mac_normalized)
+                    elif msg_type_code == 7: 
+                        logger.info(f"Ricevuto DHCPRELEASE da MAC: {format_mac_for_display(client_mac_normalized)} per IP: {packet.ciaddr}")
                 
-                logger.info(f"Ricevuto {msg_type_name} da MAC: {format_mac_for_display(client_mac_normalized)} (Originale: {packet.chaddr})")
+                else: 
+                    logger.debug(f"Pacchetto senza magic cookie DHCP ricevuto da {addr}. Dati: {data!r}. Tento di processarlo come BOOTP.")
+                    if len(data) >= 28:
+                        try:
+                            op, htype_int, hlen, hops, xid, secs, flags, \
+                            ciaddr_raw, yiaddr_raw, siaddr_raw, giaddr_raw = struct.unpack('!BBBB L HH LLLL', data[:28])
+                            chaddr_bytes = data[28:28+16] 
+                            if op == 1: 
+                                htype_str = DHCPPacket.htype_map.get(htype_int, str(htype_int))
+                                giaddr_ip = IPv4Address(giaddr_raw)
+                                response = self._handle_bootp_request(op, htype_str, hlen, xid, chaddr_bytes, giaddr_ip, addr)
+                            else:
+                                logger.warning(f"Pacchetto BOOTP non BOOTREQUEST (op={op}) da {addr}, ignorato.")
+                        except struct.error as se:
+                            logger.warning(f"Errore unpack pacchetto BOOTP da {addr}: {se}. Dati: {data!r}")
+                        except Exception as e_bootp:
+                            logger.error(f"Errore imprevisto processando pacchetto BOOTP da {addr}: {e_bootp}. Dati: {data!r}", exc_info=True)
+                    else:
+                        logger.warning(f"Pacchetto troppo corto per essere BOOTP da {addr}, ignorato. Lunghezza: {len(data)}")
 
-                response = None
-                if msg_type_code == 1: # DISCOVER
-                    response = self._handle_discover(packet, client_mac_normalized)
-                elif msg_type_code == 3: # REQUEST
-                    response = self._handle_request(packet, client_mac_normalized)
-
-                if response:
+                if response: 
                     dest_ip = '255.255.255.255'
-                    if packet.giaddr != IPv4Address('0.0.0.0'):
-                        dest_ip = str(packet.giaddr)
+                    current_giaddr = IPv4Address('0.0.0.0')
+                    if 'packet' in locals() and hasattr(packet, 'giaddr'): 
+                        current_giaddr = packet.giaddr
+                    elif 'giaddr_ip' in locals(): 
+                        current_giaddr = giaddr_ip
                     
-                    self.sock.sendto(response.asbytes, (dest_ip, 68))
+                    if current_giaddr != IPv4Address('0.0.0.0'):
+                        dest_ip = str(current_giaddr)
+                        logger.debug(f"Invio risposta a relay agent {dest_ip} (porta 67)")
+                        self.sock.sendto(response.asbytes, (dest_ip, 67)) 
+                    else:
+                        logger.debug(f"Invio risposta a {dest_ip}:68")
+                        self.sock.sendto(response.asbytes, (dest_ip, 68))
 
             except socket.timeout:
                 continue
+            except options.MalformedOptionError as moe: 
+                logger.warning(f"Opzione DHCP malformata ricevuta da {addr if 'addr' in locals() else 'sconosciuto'}: {moe}")
+                continue
             except Exception as e:
-                logger.error(f"Errore nel loop DHCP: {e}", exc_info=True)
-
+                logger.error(f"Errore generico nel loop DHCP: {e}", exc_info=True)
+                
         if self.sock:
              self.sock.close()
         self.sock = None
@@ -577,13 +622,13 @@ class DhcpServerThread(threading.Thread):
 
 # --- Flask App ---
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'sostituisci-con-una-chiave-veramente-segreta-e-casuale'
+app.config['SECRET_KEY'] = 'una-chiave-segreta-molto-casuale-e-difficile'
 
 @app.context_processor
 def inject_global_vars():
     return dict(
         active_page=request.endpoint, 
-        network_tools_available=network_tools_available 
+        network_tools_available=network_tools_available
     )
 
 def get_interfaces():
@@ -600,21 +645,22 @@ def get_interfaces():
 
 # --- Forms (Flask-WTF) ---
 class ConfigForm(FlaskForm):
-    interface = SelectField('Interfaccia di Ascolto', choices=[], validators=[DataRequired()]) # choices verranno popolate dinamicamente
+    interface = SelectField('Interfaccia di Ascolto', choices=[], validators=[DataRequired()])
     server_ip = StringField('IP Server', validators=[DataRequired(), IPAddress(message="IP Server non valido.")])
     subnet_mask = StringField('Subnet Mask', validators=[DataRequired(), IPAddress(message="Subnet Mask non valida.")])
     gateway = StringField('Gateway', validators=[DataRequired(), IPAddress(message="Gateway non valido.")])
-    dns_servers = StringField('Server DNS (separati da ,)', validators=[DataRequired()])
+    dns_servers = StringField('Server DNS (separati da ,)', validators=[Optional()])
     lease_time = IntegerField('Durata Lease (sec)', validators=[DataRequired(), NumberRange(min=60, message="Lease time minimo 60s.")])
     pool_start = StringField('Inizio Pool', validators=[DataRequired(), IPAddress(message="IP Inizio Pool non valido.")])
     pool_end = StringField('Fine Pool', validators=[DataRequired(), IPAddress(message="IP Fine Pool non valido.")])
     submit = SubmitField('Salva Configurazione')
 
     def validate_dns_servers(self, field):
-        try:
-            [IPv4Address(ip.strip()) for ip in field.data.split(',') if ip.strip()]
-        except Exception:
-            raise ValueError("Uno o più server DNS non sono indirizzi IP validi.")
+        if field.data: 
+            try:
+                [IPv4Address(ip.strip()) for ip in field.data.split(',') if ip.strip()]
+            except Exception:
+                raise ValueError("Uno o più server DNS non sono indirizzi IP validi.")
 
 class ReservationForm(FlaskForm):
     mac_address = StringField('MAC Address (es. AA:BB:CC:00:11:22)', validators=[DataRequired(), MacAddress(message="MAC Address non valido.")])
@@ -642,21 +688,23 @@ def config_route():
                     flash('L\'IP di inizio pool deve essere minore di quello di fine.', 'danger')
                     return render_template('config.html', form=form)
 
-                dns_list = [str(IPv4Address(ip.strip())) for ip in form.dns_servers.data.split(',') if ip.strip()]
+                dns_list_str = form.dns_servers.data
+                dns_list = [str(IPv4Address(ip.strip())) for ip in dns_list_str.split(',') if ip.strip()] if dns_list_str else []
 
-                set_config('interface', form.interface.data)
-                set_config('server_ip', form.server_ip.data)
-                set_config('subnet_mask', form.subnet_mask.data)
-                set_config('gateway', form.gateway.data)
-                set_config('dns_servers', json.dumps(dns_list))
-                set_config('lease_time', form.lease_time.data)
-                set_config('pool_start', form.pool_start.data)
-                set_config('pool_end', form.pool_end.data)
+                set_config_value('interface', form.interface.data)
+                set_config_value('server_ip', form.server_ip.data)
+                set_config_value('subnet_mask', form.subnet_mask.data)
+                set_config_value('gateway', form.gateway.data)
+                set_config_value('dns_servers', json.dumps(dns_list))
+                set_config_value('lease_time', form.lease_time.data)
+                set_config_value('pool_start', form.pool_start.data)
+                set_config_value('pool_end', form.pool_end.data)
                 flash('Configurazione salvata con successo.', 'success')
-                logger.info("Configurazione salvata via Web UI.")
+                logger.info(f"Configurazione salvata.")
                 return redirect(url_for('config_route'))
             except Exception as e:
                 flash(f'Errore nel salvataggio: {e}', 'danger')
+                logger.error(f"Errore salvataggio configurazione: {e}", exc_info=True)
 
     elif request.method == 'GET':
         form.interface.data = get_config('interface', '0.0.0.0')
@@ -667,34 +715,31 @@ def config_route():
         form.lease_time.data = int(get_config('lease_time', '3600'))
         form.pool_start.data = get_config('pool_start', '192.168.56.100')
         form.pool_end.data = get_config('pool_end', '192.168.56.200')
-    else: 
-        for field, errors in form.errors.items():
-            for error in errors:
-                flash(f"Errore nel campo '{getattr(form, field).label.text}': {error}", 'danger')
-
+    
     return render_template('config.html', form=form)
 
 @app.route('/reservations')
 def reservations():
-    form = ReservationForm()
-    static_res_raw = get_static_reservations()
+    form = ReservationForm() 
+    static_res_raw = get_static_reservations_from_db()
     static_res_display = {format_mac_for_display(mac): ip for mac, ip in static_res_raw.items()}
     return render_template('reservations.html', reservations=static_res_display, form=form)
 
 @app.route('/reservations/add', methods=['POST'])
 def add_reservation_route():
-    form = ReservationForm()
+    form = ReservationForm() 
     if form.validate_on_submit():
-        if add_static_reservation(form.mac_address.data, form.ip_address.data):
-            flash_msg = f'Prenotazione aggiunta/aggiornata per {format_mac_for_display(form.mac_address.data)} a {form.ip_address.data}.'
+        success, message, flash_category = add_static_reservation_to_db(form.mac_address.data, form.ip_address.data)
+        if success:
+            flash_msg = message 
             if not (dhcp_thread and dhcp_thread.is_running()):
                 flash_msg += " Avviare il server DHCP per applicare."
             else:
                 flash_msg += " Riavviare il server DHCP per rendere la modifica pienamente operativa."
-            flash(flash_msg, 'success')
+            flash(flash_msg, flash_category) 
         else:
-            if not any(True for _ in app.jinja_env.globals['get_flashed_messages'](with_categories=True, category_filter=['danger','warning'])):
-                 flash('Errore durante l\'aggiunta della prenotazione.', 'danger')
+            if not get_flashed_messages(with_categories=True, category_filter=['danger','warning']): 
+                 flash(message or 'Errore sconosciuto durante l\'aggiunta della prenotazione.', flash_category or 'danger')
     else:
         for field, errors in form.errors.items():
             for error in errors:
@@ -703,11 +748,11 @@ def add_reservation_route():
 
 @app.route('/reservations/remove', methods=['POST'])
 def remove_reservation_route():
-    mac_from_form = request.form.get('mac_address')
+    mac_from_form = request.form.get('mac_address') 
     
     rows_deleted = 0 
     if mac_from_form:
-        rows_deleted = remove_static_reservation(mac_from_form)
+        rows_deleted = remove_static_reservation_from_db(mac_from_form) 
         
     if rows_deleted > 0:
         flash_msg = f'Prenotazione per {format_mac_for_display(mac_from_form)} rimossa con successo.'
@@ -739,14 +784,11 @@ if network_tools_available:
     @app.route('/api/start_network_scan', methods=['POST'])
     def api_start_network_scan():
         global scan_in_progress, last_scan_results, scan_thread_obj, scan_stop_event, current_scan_network_cidr, scan_lock
-
         with scan_lock:
             if scan_in_progress:
                 return jsonify({"status": "error", "message": f"Una scansione è già in corso per {current_scan_network_cidr}."}), 409
-        
         data = request.get_json()
-        network_to_scan = data.get('network_cidr')
-
+        network_to_scan = data.get('network_cidr') if data else None
         if not network_to_scan:
             try:
                 server_ip_str = get_config('server_ip')
@@ -759,9 +801,7 @@ if network_tools_available:
             except Exception as e:
                 logger.error(f"Errore nel determinare la rete di scansione dalla configurazione: {e}")
                 return jsonify({"status": "error", "message": "Errore nel determinare la rete di scansione."}), 500
-        
         logger.info(f"Richiesta scansione rete per: {network_to_scan}")
-        
         def scan_thread_target(app_context, net_cidr, stop_event_ref):
             global last_scan_results, scan_in_progress, current_scan_network_cidr, scan_thread_obj, scan_lock
             with app_context: 
@@ -775,21 +815,17 @@ if network_tools_available:
                          else:
                             device["mac_display"] = "N/A"
                     scan_in_progress = False
-                    # Non resettare current_scan_network_cidr qui, così la UI sa quale scansione è finita
                     scan_thread_obj = None 
                 logger.info(f"Thread di scansione per {net_cidr} completato/interrotto. Risultati: {len(last_scan_results)}")
-
         with scan_lock:
             scan_in_progress = True
             last_scan_results = [] 
             current_scan_network_cidr = network_to_scan
             scan_stop_event = threading.Event()
-            
             app_context = app.app_context()
             scan_thread_obj = threading.Thread(target=scan_thread_target, args=(app_context, network_to_scan, scan_stop_event))
             scan_thread_obj.daemon = True
             scan_thread_obj.start()
-
         return jsonify({"status": "ok", "message": f"Scansione di rete per {network_to_scan} avviata in background."})
 
     @app.route('/api/scan_status', methods=['GET'])
@@ -816,7 +852,6 @@ if network_tools_available:
                 results_to_send.append(dev_copy)
             return jsonify({"status": "ok", "devices": results_to_send})
 
-
     @app.route('/api/stop_network_scan', methods=['POST'])
     def api_stop_network_scan():
         global scan_in_progress, scan_thread_obj, scan_stop_event, scan_lock
@@ -829,15 +864,16 @@ if network_tools_available:
                 return jsonify({"status": "ok", "message": "Nessuna scansione attualmente in corso."})
             else: 
                 return jsonify({"status": "error", "message": "Impossibile interrompere la scansione (stato inconsistente)."}), 500
+
 # --- API Routes Esistenti ---
-@app.route('/api/status')
-def api_status():
+@app.route('/api/dhcp_status')
+def api_dhcp_status():
     global dhcp_thread
     return jsonify({"running": dhcp_thread is not None and dhcp_thread.is_running()})
 
 @app.route('/api/leases')
 def api_leases():
-    leases = get_all_leases()
+    leases = get_all_leases_from_db()
     return jsonify([
         {"mac": format_mac_for_display(l[0]), "ip": l[1], "end_time": l[2], "hostname": l[3], "is_static": bool(l[4])}
         for l in leases
@@ -847,13 +883,12 @@ def api_leases():
 def api_logs():
     return jsonify(get_logs_from_db())
 
-@app.route('/api/start', methods=['POST'])
-def api_start():
+@app.route('/api/start_dhcp', methods=['POST'])
+def api_start_dhcp():
     global dhcp_thread, dhcp_server_instance
     if dhcp_thread and dhcp_thread.is_running():
-        return jsonify({"status": "error", "message": "Server già attivo"}), 400
-
-    logger.info("Richiesta di avvio server via Web UI...")
+        return jsonify({"status": "error", "message": "Server DHCP già attivo"}), 400
+    logger.info(f"Richiesta di avvio server DHCP.")
     dhcp_server_instance = DhcpServerThread()
     dhcp_thread = dhcp_server_instance
     dhcp_thread.start()
@@ -863,16 +898,15 @@ def api_start():
     else:
          dhcp_thread = None
          dhcp_server_instance = None
-         logger.error("Avvio server DHCP fallito. Controllare i log e la configurazione (es. permessi, interfaccia corretta).")
-         return jsonify({"status": "error", "message": "Avvio server DHCP fallito. Controllare i log per dettagli."}), 500
+         logger.error("Avvio server DHCP fallito. Controllare i log e la configurazione.")
+         return jsonify({"status": "error", "message": "Avvio server DHCP fallito. Controllare i log."}), 500
 
-@app.route('/api/stop', methods=['POST'])
-def api_stop():
+@app.route('/api/stop_dhcp', methods=['POST'])
+def api_stop_dhcp():
     global dhcp_thread, dhcp_server_instance
     if not dhcp_thread or not dhcp_thread.is_running():
-        return jsonify({"status": "error", "message": "Server non attivo"}), 400
-
-    logger.info("Richiesta di arresto server via Web UI...")
+        return jsonify({"status": "error", "message": "Server DHCP non attivo"}), 400
+    logger.info(f"Richiesta di arresto server DHCP.")
     dhcp_server_instance.stop()
     dhcp_thread.join(timeout=5)
     if dhcp_thread.is_alive():
@@ -893,41 +927,28 @@ def api_ping(ip_address_str):
     if not is_valid_ip(ip_address_str):
         logger.warning(f"Tentativo di ping verso un indirizzo non valido: {ip_address_str}")
         return jsonify({"status": "error", "output": "Indirizzo IP non valido."}), 400
-
     logger.info(f"Esecuzione ping verso: {ip_address_str}")
-    
     num_pings_str = "5"
     num_pings_int = int(num_pings_str)
     ping_timeout_per_packet_ms_str = "1000" 
-    
     subprocess_timeout_seconds = num_pings_int * (int(ping_timeout_per_packet_ms_str) / 1000) + 3 
     if subprocess_timeout_seconds < 7: subprocess_timeout_seconds = 7
-
     if sys.platform == "win32":
         command = ["ping", "-n", num_pings_str, "-w", ping_timeout_per_packet_ms_str, ip_address_str]
     else:
         command = ["ping", "-c", num_pings_str, "-W", "1", ip_address_str]
-
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=subprocess_timeout_seconds, 
-            check=False
-        )
+        result = subprocess.run(command, capture_output=True, text=True, timeout=subprocess_timeout_seconds, check=False)
         output = f"--- Eseguendo: {' '.join(command)} ---\n"
         output += f"--- Codice Uscita: {result.returncode} ---\n\n"
         output += result.stdout
         output += result.stderr
-
         if result.returncode == 0:
              logger.info(f"Ping {ip_address_str}: Successo")
              return jsonify({"status": "ok", "output": output})
         else:
              logger.warning(f"Ping {ip_address_str}: Fallito o Timeout (codice uscita: {result.returncode})")
              return jsonify({"status": "error", "output": output})
-
     except subprocess.TimeoutExpired:
         logger.error(f"Ping {ip_address_str}: Timeout subprocess ({subprocess_timeout_seconds}s) scaduto!")
         return jsonify({"status": "error", "output": f"Ping timeout ({subprocess_timeout_seconds} secondi)."}), 500
@@ -939,37 +960,34 @@ def api_ping(ip_address_str):
         return jsonify({"status": "error", "output": f"Errore: {e}"}), 500
 
 @app.route('/api/set_lease_ip', methods=['POST'])
-def set_lease_ip():
+def set_lease_ip(): 
     data = request.get_json()
     if not data:
         return jsonify({"status": "error", "message": "Dati JSON non validi o mancanti."}), 400
-        
     mac_address = data.get('mac_address')
     new_ip_address = data.get('new_ip_address')
-
     if not mac_address or not new_ip_address:
         return jsonify({"status": "error", "message": "MAC address e nuovo IP sono richiesti."}), 400
-
-    try:
-        IPv4Address(new_ip_address) 
-    except ValueError:
-        return jsonify({"status": "error", "message": f"Il nuovo indirizzo IP '{new_ip_address}' non è valido."}), 400
-    
+    try: IPv4Address(new_ip_address) 
+    except ValueError: return jsonify({"status": "error", "message": f"Il nuovo indirizzo IP '{new_ip_address}' non è valido."}), 400
     normalized_mac = normalize_mac(mac_address) 
     if not normalized_mac or len(normalized_mac) != 12:
         return jsonify({"status": "error", "message": f"Formato MAC address '{mac_address}' non valido."}), 400
 
-    if add_static_reservation(normalized_mac, new_ip_address): 
-        flash_message = (f"Prenotazione statica per MAC {format_mac_for_display(normalized_mac)} "
-                         f"impostata/aggiornata a {new_ip_address}. "
-                         f"ARRESTARE e RIAVVIARE il server DHCP (dalla tab 'Controllo Server') "
-                         f"e far rinnovare il lease al client per applicare la modifica.")
-        flash(flash_message, 'info')
-        return jsonify({"status": "ok", "message": "Prenotazione statica impostata/aggiornata. Vedi messaggio sopra per i passaggi successivi."})
+    success, message, flash_category = add_static_reservation_to_db(normalized_mac, new_ip_address)
+    
+    if success:
+        response_message = message 
+        if dhcp_thread and dhcp_thread.is_running():
+             response_message += " Riavviare il server DHCP per rendere la modifica pienamente operativa."
+        else:
+             response_message += " Avviare il server DHCP per applicare."
+        flash(response_message, flash_category) 
+        return jsonify({"status": "ok" if flash_category != "danger" else "warning", "message": "Operazione di prenotazione completata. Vedi messaggi."})
     else:
-        if not any(True for _ in app.jinja_env.globals['get_flashed_messages'](with_categories=True, category_filter=['danger','warning'])):
-            flash(f"Impossibile impostare la prenotazione per MAC {format_mac_for_display(normalized_mac)} a {new_ip_address}. Controllare i log.", 'danger')
-        return jsonify({"status": "error", "message": f"Impossibile impostare prenotazione per {format_mac_for_display(normalized_mac)}. Controllare i log."}), 500
+        flash(message, flash_category) 
+        return jsonify({"status": "error", "message": message}), 400
+
 
 # --- Main ---
 if __name__ == '__main__':
@@ -982,7 +1000,6 @@ if __name__ == '__main__':
         print("*" * 60)
         print("ATTENZIONE: Eseguire Flask in questo modo NON è per produzione.")
         print("           L'interfaccia è accessibile su http://<TUO_IP>:5000")
-        print("           Questa interfaccia NON HA AUTENTICAZIONE.")
         print("           Il server DHCP richiede permessi ADMIN per partire.")
         print("*" * 60)
         app.run(host='0.0.0.0', port=5000, debug=False)
